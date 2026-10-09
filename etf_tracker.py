@@ -1,7 +1,7 @@
 import os
 import json
-import requests
 import gspread
+import yfinance as yf
 
 # --- CONFIGURATION ---
 SPREADSHEET_ID = "1E558JcLuLMyBqclmqrRhvlswMK9FS-NdJw_o3W1C7vI"
@@ -21,15 +21,47 @@ ETF_LIST = {
     "IAK": "iShares US Insurance ETF"
 }
 
-def main():
-    # Get environment secrets
-    service_account_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
-    fmp_api_key = os.environ.get("FMP_API_KEY")
+def fetch_etf_holdings(ticker):
+    """
+    Fetches ETF holdings using yfinance (Free, no paid API key required).
+    """
+    holdings = {}
+    try:
+        etf = yf.Ticker(ticker)
+        funds_data = getattr(etf, "funds_data", None)
+        
+        # Primary method: top_holdings dataframe
+        if funds_data and hasattr(funds_data, "top_holdings") and funds_data.top_holdings is not None:
+            df = funds_data.top_holdings
+            if not df.empty:
+                for stock_identifier, row in df.iterrows():
+                    weight = row.get("Holding Percent", 0)
+                    if weight <= 1.0:
+                        weight = weight * 100  # Convert decimal (0.08) to percentage (8.0%)
+                    holdings[str(stock_identifier)] = round(float(weight), 2)
+                return holdings
 
+        # Fallback method: .info holdings list
+        info = getattr(etf, "info", {})
+        if "holdings" in info and info["holdings"]:
+            for item in info["holdings"]:
+                symbol = item.get("symbol") or item.get("holdingName")
+                pct = item.get("holdingPercent", 0)
+                if pct <= 1.0:
+                    pct = pct * 100
+                if symbol:
+                    holdings[symbol] = round(float(pct), 2)
+            return holdings
+
+    except Exception as e:
+        print(f"Error fetching {ticker} via yfinance: {e}")
+
+    return holdings
+
+def main():
+    service_account_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
     if not service_account_str:
         raise ValueError("Error: Missing GOOGLE_SERVICE_ACCOUNT environment variable.")
-    if not fmp_api_key:
-        raise ValueError("Error: Missing FMP_API_KEY environment variable.")
 
     # 1. Initialize Google Sheets Client
     print("Connecting to Google Sheets...")
@@ -52,7 +84,6 @@ def main():
         for row in existing_records[1:]:
             if len(row) >= 3 and row[0] and row[1]:
                 etf_name_ticker = row[0]
-                # Extract ticker from "ETF Name (TICKER)" format
                 if "(" in etf_name_ticker and ")" in etf_name_ticker:
                     ticker = etf_name_ticker.split("(")[-1].replace(")", "").strip()
                 else:
@@ -67,29 +98,7 @@ def main():
                 except ValueError:
                     continue
 
-    # 3. Fetch ETF Holdings from API
-    def fetch_etf_holdings(ticker):
-        url = f"https://financialmodelingprep.com/api/v3/etf-holder/{ticker}?apikey={fmp_api_key}"
-        try:
-            res = requests.get(url, timeout=15)
-            if res.status_code == 200:
-                data = res.json()
-                holdings = {}
-                if isinstance(data, list):
-                    for item in data:
-                        stock = item.get("asset") or item.get("symbol")
-                        weight = item.get("weightPercentage")
-                        if stock and weight is not None:
-                            holdings[stock] = float(weight)
-                return holdings
-            else:
-                print(f"API Error ({res.status_code}) fetching {ticker}")
-                return None
-        except Exception as e:
-            print(f"Exception fetching {ticker}: {e}")
-            return None
-
-    # 4. Process Holdings and Identify Updates
+    # 3. Process Holdings and Identify Updates
     headers = ["Name of ETF (Ticker)", "Stock Holding", "% Holding", "Major Update in Holding"]
     new_sheet_data = [headers]
 
@@ -98,9 +107,9 @@ def main():
         print(f"Processing {ticker}...")
         current_holdings = fetch_etf_holdings(ticker)
 
-        # Safety Fallback: If API call fails, keep old data to prevent accidental wiping
-        if current_holdings is None:
-            print(f"Warning: Keeping existing sheet records for {ticker} due to fetch error.")
+        # Fallback if API returns empty data
+        if not current_holdings:
+            print(f"Warning: No holdings found for {ticker}. Keeping existing records.")
             if ticker in previous_holdings:
                 for stock, weight in previous_holdings[ticker].items():
                     new_sheet_data.append([
@@ -152,7 +161,7 @@ def main():
                         f"Sold Entirely (was {prev_weight:.2f}%)"
                     ])
 
-    # 5. Overwrite Worksheet with Clean Data
+    # 4. Overwrite Worksheet with Clean Data
     print(f"Updating '{WORKSHEET_NAME}' tab with {len(new_sheet_data) - 1} records...")
     worksheet.clear()
     worksheet.update(values=new_sheet_data, range_name='A1')
