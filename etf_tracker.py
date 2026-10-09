@@ -1,12 +1,14 @@
 import os
 import json
+import requests
 import gspread
+from bs4 import BeautifulSoup
 import yfinance as yf
 
 # --- CONFIGURATION ---
 SPREADSHEET_ID = "1E558JcLuLMyBqclmqrRhvlswMK9FS-NdJw_o3W1C7vI"
 WORKSHEET_NAME = "ETFs"
-UPDATE_THRESHOLD = 0.5  # % change threshold to flag as a major update (e.g., 0.5%)
+UPDATE_THRESHOLD = 0.5  # % change threshold to flag as a major update
 
 # Tickers & Names
 ETF_LIST = {
@@ -21,40 +23,62 @@ ETF_LIST = {
     "IAK": "iShares US Insurance ETF"
 }
 
-def fetch_etf_holdings(ticker):
+def fetch_full_etf_holdings(ticker):
     """
-    Fetches ETF holdings using yfinance (Free, no paid API key required).
+    Fetches 100% of ETF holdings from StockAnalysis.
+    Falls back to yfinance top holdings if scraping is blocked.
     """
     holdings = {}
+    url = f"https://stockanalysis.com/etf/{ticker.lower()}/holdings/"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            table = soup.find("table")
+            if table:
+                rows = table.find_all("tr")
+                for row in rows[1:]:
+                    cols = row.find_all("td")
+                    if len(cols) >= 3:
+                        symbol = cols[0].text.strip()
+                        name = cols[1].text.strip()
+                        weight_str = cols[2].text.strip().replace("%", "").replace(",", "")
+
+                        # Prefer ticker symbol, fall back to holding name
+                        stock_id = symbol if (symbol and symbol != "-") else name
+
+                        try:
+                            weight = float(weight_str)
+                            if stock_id:
+                                holdings[stock_id] = round(weight, 2)
+                        except ValueError:
+                            continue
+
+                if holdings:
+                    print(f"Successfully retrieved {len(holdings)} holdings for {ticker}.")
+                    return holdings
+    except Exception as e:
+        print(f"Full fetch failed for {ticker}: {e}")
+
+    # Fallback to yfinance top holdings
+    print(f"Falling back to yfinance top holdings for {ticker}...")
     try:
         etf = yf.Ticker(ticker)
         funds_data = getattr(etf, "funds_data", None)
-        
-        # Primary method: top_holdings dataframe
         if funds_data and hasattr(funds_data, "top_holdings") and funds_data.top_holdings is not None:
             df = funds_data.top_holdings
             if not df.empty:
                 for stock_identifier, row in df.iterrows():
                     weight = row.get("Holding Percent", 0)
                     if weight <= 1.0:
-                        weight = weight * 100  # Convert decimal (0.08) to percentage (8.0%)
+                        weight = weight * 100
                     holdings[str(stock_identifier)] = round(float(weight), 2)
-                return holdings
-
-        # Fallback method: .info holdings list
-        info = getattr(etf, "info", {})
-        if "holdings" in info and info["holdings"]:
-            for item in info["holdings"]:
-                symbol = item.get("symbol") or item.get("holdingName")
-                pct = item.get("holdingPercent", 0)
-                if pct <= 1.0:
-                    pct = pct * 100
-                if symbol:
-                    holdings[symbol] = round(float(pct), 2)
-            return holdings
-
     except Exception as e:
-        print(f"Error fetching {ticker} via yfinance: {e}")
+        print(f"yfinance fallback failed for {ticker}: {e}")
 
     return holdings
 
@@ -73,7 +97,7 @@ def main():
         worksheet = sheet.worksheet(WORKSHEET_NAME)
     except gspread.exceptions.WorksheetNotFound:
         print(f"Worksheet '{WORKSHEET_NAME}' not found. Creating it...")
-        worksheet = sheet.add_worksheet(title=WORKSHEET_NAME, rows="1000", cols="4")
+        worksheet = sheet.add_worksheet(title=WORKSHEET_NAME, rows="2000", cols="4")
 
     # 2. Read Existing Sheet Data for Baseline Comparison
     print("Reading existing worksheet data...")
@@ -102,10 +126,10 @@ def main():
     headers = ["Name of ETF (Ticker)", "Stock Holding", "% Holding", "Major Update in Holding"]
     new_sheet_data = [headers]
 
-    print("Fetching live holdings and computing differences...")
+    print("Fetching live full holdings and computing differences...")
     for ticker, etf_name in ETF_LIST.items():
         print(f"Processing {ticker}...")
-        current_holdings = fetch_etf_holdings(ticker)
+        current_holdings = fetch_full_etf_holdings(ticker)
 
         # Fallback if API returns empty data
         if not current_holdings:
